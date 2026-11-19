@@ -105,3 +105,29 @@ Semantics follow Prometheus 3: an instant selector takes the newest sample in `(
 | no zero-point limit | 3,554 |
 
 **What broke:** the first version of this test passed with 0 mismatches on the first try, and so did all four mutations. A test that can't fail is worthless, so I printed one query from both engines: both were empty. My data generator compared a relative timestamp with an absolute one, so every counter series kept only its first sample, and the two engines agreed on nothing. After fixing it the test compares 361,719 points instead of 49,702. It also now fails if any query shape yields fewer than 200 points.
+
+### Step 5: remote write in, the Prometheus query API out
+
+- **`POST /api/v1/write`** (`remote/`, `server/`): Prometheus remote write 1.0, a snappy-compressed protobuf `WriteRequest`. The protobuf is decoded by hand with `protowire` (four small messages; unknown fields such as metadata and exemplars are skipped; native histograms are counted and ignored). Status codes are what Prometheus's sender expects: 204 stored; 400 for requests that can never succeed (bad encoding, out-of-order or too-old samples), which the sender drops; 500 when a retry might help.
+- **`/api/v1/query` and `/api/v1/query_range`**: the PromQL subset, answering in Prometheus's JSON format (Unix-second timestamps, values as strings), so Grafana could point at it (not tried).
+- **`/metrics`**: the server's own counters in the Prometheus text format; **`/-/healthy`**.
+- `minitsdb serve` runs compaction on a timer.
+
+Results:
+
+| Test | Result |
+|---|---|
+| Requests built with Prometheus's own `prompb` types (with exemplars, metadata, a native histogram, empty label values, a negative timestamp, -Inf) | decoded exactly |
+| Fuzzing the decoder | 892,900 inputs in 30 s, no panic |
+| 2 h of node-exporter-like scrapes (20 hosts × 6 series × 480 scrapes = 57,600 samples) sent like Prometheus, **server killed at scrape 200** and restarted | sender retried 5 times, nothing lost: 480 points for every `up` series; all 440 points of `sum by (mode) (rate(cpu_seconds_total[5m]))` equal the exact rate; gauges exact in the 3 blocks and the head |
+| A sample older than the head | 400: "sample older than the head (already in a block)" |
+| Throughput: 100 requests of 2,000 samples (Prometheus's default batch), one client | 158,237 samples/s, 12.6 ms per request including the fsync |
+
+**Found while testing:** a -0 sent with Prometheus's encoder arrives as +0. proto3 doesn't write a field equal to its zero value, and -0 == 0, so the value is left out and the receiver sees the default. Remote write 1.0 can't carry the sign of zero.
+
+To point a real Prometheus at it (not tried: there's no Prometheus on this laptop):
+
+```yaml
+remote_write:
+  - url: http://127.0.0.1:9201/api/v1/write
+```
