@@ -33,3 +33,29 @@ What the table taught me:
 - **Jitter costs as much as the value.** ±5 ms of scrape jitter doubled a counter's cost (1.64 → 3.31): each timestamp change now takes a 16-bit bucket instead of 1 bit.
 
 Speed: appending 42.6 ns per sample, reading 22.9 ns per sample. The first version wrote one bit at a time (72.7 ns); writing up to a byte at once took it to 42.6.
+
+### Step 2: the head, the write-ahead log, and crashes
+
+- **Write path** (`tsdb.Append`): resolve or create each series, check the sample is newer than the series' last one, write one WAL record for new series and one for samples, **fsync**, and only then add the samples to the in-memory head and return. A nil error means durable.
+- **Rules:** a sample older than its series' newest is rejected (out of order); the same timestamp with a different value is rejected (duplicate); the same timestamp *and* value is ignored, so a retried write is harmless.
+- **WAL** (`wal/`): numbered segment files of records framed as type | length | CRC32C | payload. On open, every record is replayed into the head. A short or corrupt record ends the log: the segment is truncated there, and later segments are deleted. After a crash only the tail can be damaged, and nothing after the damage was acknowledged.
+- **Head** (`tsdb/head.go`): per series a list of full chunks plus the open chunk; an inverted index from each `name=value` to sorted series refs, so a query intersects the lists for its equality matchers and filters by the rest (`!=`, `=~`, `!~`; regexes anchored like Prometheus).
+
+Tests:
+- append rules, matcher types, time ranges; a restart replays 501 records into identical series;
+- half a record appended by hand is cut off on open (29 bytes) and writing continues after the good data;
+- a flipped bit in the second of six segments: replay keeps 13 of 40 samples and drops the 3 later segments, and says so;
+- **crash test** (`e2e`): 40 runs of a separate `minitsdb ingest` process on one data directory, each resuming after the last acknowledged batch of 50 samples and each killed: 13 times from outside at a random moment, 9 halfway through a WAL write, 10 after the write but before fsync, 8 after fsync but before the samples reached memory. Result: **all 5,023 acknowledged batches present, none partial.** 30 batches written but never acknowledged were found already stored when resent, so the retry was a no-op. Replay cut 2,970 torn bytes in total.
+
+What fsync costs on this laptop (`TestAppendThroughput`):
+
+| Writes | Throughput |
+|---|---|
+| 1 sample per write, fsync each | 376 samples/s (2.7 ms per write) |
+| 100 per write, fsync each | 34,640 samples/s |
+| 1,000 per write, fsync each | 221,067 samples/s |
+| 1,000 per write, no fsync (unsafe) | 1,807,550 samples/s |
+
+The fsync takes about 2.7 ms whatever the size, so durability is affordable only in batches. That's why Prometheus remote write sends samples in batches.
+
+Limit: these crashes kill the process, not the machine. Data the process wrote before dying is still in the operating system's cache. A power cut could lose writes that weren't fsynced, which this laptop can't simulate; the design covers it (acknowledge only after fsync), but it is untested.
