@@ -84,3 +84,24 @@ Merging helped less than I expected here: every index is held in memory, so open
 **Crash test, extended:** 60 runs with 10-minute blocks and compaction every 20 batches, killed at 8 kinds of moment. Besides the 5 from step 2, 8 kills after a block's chunks were written (before the rename), 9 after a block was in place (before the head was trimmed), 6 after a checkpoint (before old segments were deleted), and 8 after a merge (before its sources were deleted). **All 6,721 acknowledged batches present, none partial, no timestamp twice;** restarts removed 32 half-written or already-merged block directories.
 
 **What broke:** the retention test failed because it asked for data "up to 12 h" and got samples. Query ranges include their end, and the oldest kept block starts exactly at 12 h. The test was wrong; it now asks up to 12 h minus 1 ms.
+
+### Step 4: a subset of PromQL, checked against Prometheus's own engine
+
+`promql/` parses and evaluates: selectors with `=`, `!=`, `=~`, `!~`; range selectors (`x[5m]`); `rate`, `increase`, and `avg/sum/min/max/count_over_time`; `sum`, `avg`, `min`, `max`, `count` with `by (...)` or `without (...)` in either position; and `+ - * /` between numbers, between a vector and a number, and between vectors whose labels match one to one. Instant and range queries; each selector's data is fetched once per query and every step is evaluated in memory.
+
+Semantics follow Prometheus 3: an instant selector takes the newest sample in `(t − 5m, t]`, a range selector the samples in `(t − range, t]`. `rate` adds back the value before every counter reset, extrapolates towards each edge of the window only if the gap is under 1.1× the average sample spacing (otherwise by half a spacing), and never extrapolates a counter below zero. A worked example by hand is in `TestRateByHand`.
+
+**The oracle** (`TestMatchesPrometheus`): the same samples go into minitsdb and into Prometheus's own storage (`util/teststorage`, Prometheus v0.316.0, imported by the test only). 26 query shapes run over random windows with odd step sizes, through both engines, and every point is compared (relative tolerance 1e-9). The data is deliberately awkward: scrape jitter, 5% missed scrapes, counter resets, series that start late or stop early, float gauges.
+
+**Result: 520 range queries, 361,719 points, 0 mismatches.**
+
+**Proof the oracle has teeth** (`scripts/mutate.sh` breaks the engine one way at a time):
+
+| Deliberate mistake | Mismatches found |
+|---|---|
+| range window includes its left edge (Prometheus 2 behaviour) | 15 |
+| counter resets ignored | 47,503 |
+| extrapolation threshold 1.0× instead of 1.1× | 4,541 |
+| no zero-point limit | 3,554 |
+
+**What broke:** the first version of this test passed with 0 mismatches on the first try, and so did all four mutations. A test that can't fail is worthless, so I printed one query from both engines: both were empty. My data generator compared a relative timestamp with an absolute one, so every counter series kept only its first sample, and the two engines agreed on nothing. After fixing it the test compares 361,719 points instead of 49,702. It also now fails if any query shape yields fewer than 200 points.
