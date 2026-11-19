@@ -4,6 +4,30 @@ A small time-series database in the style of Prometheus's storage: Gorilla-compr
 
 Built pairing with Claude Code, as a learning project. Go 1.27; runs on this laptop only. All data is synthetic.
 
+**What it shows:**
+- **Compression with numbers:** 0.40 to 7.60 bytes per sample depending on the series (1.72 on disk for counters, index included), and why: decimals and scrape jitter are the expensive cases.
+- **Durability:** 60 runs killed at random and at 8 named points (mid-write, before fsync, inside compaction) lose no acknowledged sample and leave no partial batch or duplicate.
+- **PromQL that matches Prometheus:** 361,719 points from 520 random range queries equal Prometheus's own engine; four deliberate engine bugs are each caught by that comparison.
+- **Wire compatibility:** remote-write requests built with Prometheus's own types decode exactly, and a server killed mid-stream loses nothing.
+
+Learning notes and explain-it questions: [LEARN.md](LEARN.md). Interview brief: [`../briefs/minitsdb.md`](../briefs/minitsdb.md).
+
+```text
+POST /api/v1/write (snappy + protobuf)          GET /api/v1/query, /query_range
+        │                                                 ▲
+        ▼                                                 │ promql: parse, fetch once, evaluate per step
+   tsdb.Append ──► WAL (CRC-framed records, fsync) ──► ack
+        │
+        ▼
+   head (memory): series → Gorilla chunks of 120 samples; postings label → series refs
+        │ Compact(): oldest 2 h → block; WAL checkpoint; old segments deleted
+        ▼
+   blocks/ (immutable): chunks + index (symbols, series, postings) + meta.json
+        │ 3 × 2 h → one 6 h block; retention deletes old blocks
+        ▼
+   queries read the overlapping blocks and the head, and merge by labels
+```
+
 ## Build log
 
 ### Step 1: Gorilla compression
@@ -131,3 +155,22 @@ To point a real Prometheus at it (not tried: there's no Prometheus on this lapto
 remote_write:
   - url: http://127.0.0.1:9201/api/v1/write
 ```
+
+## Run it
+
+```bash
+go test ./...                                   # under a minute
+go run ./cmd/minitsdb serve -dir data           # remote write on :9201
+curl 'http://127.0.0.1:9201/api/v1/query?query=count(up)'
+bash scripts/mutate.sh                          # four engine bugs, each caught by the Prometheus comparison
+```
+
+## What it doesn't do
+
+- **No native histograms, exemplars, metadata, staleness markers or out-of-order ingestion.** Out-of-order samples are rejected, as Prometheus does by default.
+- **A small PromQL:** no `offset`, `@`, subqueries, `histogram_quantile`, comparison or set operators, `on`/`ignoring`/`group_left` matching, or `irate`/`delta`/`deriv`.
+- **Crashes are process kills.** Power loss (unflushed writes lost by the OS) isn't simulated; the design acknowledges only after fsync, but that path is untested.
+- **Block indexes are loaded fully into memory;** Prometheus memory-maps them. Chunks are read with `ReadAt`, not memory-mapped.
+- **One writer at a time** (a database-wide lock), and compaction blocks writes while it cuts a block.
+- **Not tested with a real Prometheus or Grafana:** compatibility was checked with Prometheus's own types and engine, not its running binary.
+- No CI, not published.
