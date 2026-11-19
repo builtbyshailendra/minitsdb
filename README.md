@@ -59,3 +59,28 @@ What fsync costs on this laptop (`TestAppendThroughput`):
 The fsync takes about 2.7 ms whatever the size, so durability is affordable only in batches. That's why Prometheus remote write sends samples in batches.
 
 Limit: these crashes kill the process, not the machine. Data the process wrote before dying is still in the operating system's cache. A power cut could lose writes that weren't fsynced, which this laptop can't simulate; the design covers it (acknowledge only after fsync), but it is untested.
+
+### Step 3: blocks on disk, compaction, retention
+
+- **Blocks** (`tsdb/block.go`): immutable directories holding `[MinT, MaxT)`: a `chunks` file (chunk bytes back to back), an `index` (a symbol table, then each series' labels as symbol numbers plus where its chunks are, then postings lists of series numbers stored as gaps, then a CRC32C) and `meta.json`. Written to `<id>.tmp`, fsynced, then renamed: a crash never leaves a half block under a real name. Chunks are read on demand with `ReadAt`; the index is loaded into memory.
+- **Cutting the head** (`Compact`): when the head spans more than 1.5 block ranges (2 h by default), its oldest aligned range becomes a level-1 block, those samples are dropped from memory (and series with nothing left are forgotten), and the WAL is **checkpointed**: the head's remaining content goes to `wal/checkpoint.N`, older segments are deleted. Replay reads the newest checkpoint, then segments from N on.
+- **Crash between steps:** the head's lower bound is the newest block's end, so on replay WAL samples already in a block are skipped. Leftover `.tmp` block directories are deleted on open, and so is any block whose sources are all inside a bigger block (a merge that died before deleting its inputs).
+- **Merging:** level-1 blocks in the same 3-range (6 h) window are merged into one level-2 block once the head has moved past it; chunks are copied as they are, not re-encoded.
+- **Retention:** blocks that end more than the retention period before the newest data are deleted.
+- **Queries** read the overlapping blocks and the head, and merge series by labels.
+
+Results:
+
+| Test | Result |
+|---|---|
+| 24 h × 200 series at 15 s (1,152,000 samples), compacting hourly | 755,000 samples/s without fsync; 3 level-2 and 2 level-1 blocks; head holds 2 h (96,000 samples); every sample reads back exactly, before and after a restart |
+| Disk use | **1.72 bytes per sample** in blocks, index included (chunks 1.68 MB, index 133 KB for 1,056,000 samples) |
+| Reopen after compaction | 9 ms (checkpoint plus 0 records after it) |
+| Merge, 24 h × 1,000 series | 11 blocks → 5; index 851 KB → 676 KB (−21%); one series over 24 h 510 → 482 µs; all 1,000 series 467 → 422 ms; merge took 263 ms |
+| Retention 6 h | 2 blocks deleted; nothing older than 12 h left |
+
+Merging helped less than I expected here: every index is held in memory, so opening fewer blocks saves little. With indexes read from disk, as in Prometheus, fewer and larger blocks matter more.
+
+**Crash test, extended:** 60 runs with 10-minute blocks and compaction every 20 batches, killed at 8 kinds of moment. Besides the 5 from step 2, 8 kills after a block's chunks were written (before the rename), 9 after a block was in place (before the head was trimmed), 6 after a checkpoint (before old segments were deleted), and 8 after a merge (before its sources were deleted). **All 6,721 acknowledged batches present, none partial, no timestamp twice;** restarts removed 32 half-written or already-merged block directories.
+
+**What broke:** the retention test failed because it asked for data "up to 12 h" and got samples. Query ranges include their end, and the oldest kept block starts exactly at 12 h. The test was wrong; it now asks up to 12 h minus 1 ms.

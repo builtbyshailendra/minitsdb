@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/builtbyshailendra/minitsdb/labels"
 	"github.com/builtbyshailendra/minitsdb/tsdb"
@@ -26,16 +27,18 @@ func main() {
 	batches := fs.Int("batches", 1<<30, "ingest: number of batches")
 	series := fs.Int("series", 50, "ingest: series per batch")
 	segSize := fs.Int64("segment-size", 0, "WAL segment size in bytes (0 = 32 MiB)")
+	blockRange := fs.Duration("block-range", 2*time.Hour, "time span of a level-1 block")
+	compactEvery := fs.Int("compact-every", 0, "ingest: run compaction every N batches (0 = never)")
 	_ = fs.Parse(args)
 
 	switch cmd {
 	case "ingest":
-		db, err := tsdb.Open(tsdb.Options{Dir: *dir, SegmentSize: *segSize})
+		db, err := tsdb.Open(tsdb.Options{Dir: *dir, SegmentSize: *segSize, BlockRange: blockRange.Milliseconds()})
 		if err != nil {
 			fail(err)
 		}
 		r := db.Replay
-		fmt.Printf("replayed segments=%d records=%d torn=%d dropped=%d\n", r.Segments, r.Records, r.TornBytes, r.Dropped)
+		fmt.Printf("replayed segments=%d records=%d torn=%d dropped=%d cleaned=%d\n", r.Segments, r.Records, r.TornBytes, r.Dropped, db.Cleaned)
 		for i := *from; i < *from+*batches; i++ {
 			res, err := db.Append(Batch(i, *series))
 			if err != nil {
@@ -45,6 +48,11 @@ func main() {
 				fail(fmt.Errorf("batch %d: %d rejected: %v", i, res.Rejected, res.FirstErr))
 			}
 			fmt.Printf("ack %d ignored=%d\n", i, res.Ignored)
+			if *compactEvery > 0 && i%*compactEvery == 0 {
+				if err := db.Compact(); err != nil {
+					fail(err)
+				}
+			}
 		}
 		_ = db.Close()
 	default:
