@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - name: tests (crash runs, remote write end to end, Prometheus engine as the oracle)
+        run: go test -count=1 -timeout 15m ./...
+      - name: fuzz the chunk codec and the remote-write parser, 30 s each
+        run: |
+          go test -run '^$' -fuzz '^FuzzRoundTrip$' -fuzztime 30s ./chunk
+          go test -run '^$' -fuzz '^FuzzParse$' -fuzztime 30s ./remote
+      - name: mutation check (four engine bugs, each must be caught)
+        run: bash scripts/mutate.sh

@@ -1,5 +1,7 @@
 # minitsdb
 
+[![ci](https://github.com/builtbyshailendra/minitsdb/actions/workflows/ci.yml/badge.svg)](https://github.com/builtbyshailendra/minitsdb/actions/workflows/ci.yml)
+
 A small time-series database in the style of Prometheus's storage: Gorilla-compressed chunks, a write-ahead log, an in-memory head block, immutable blocks on disk with an inverted index, compaction, a subset of PromQL, and a Prometheus remote-write receiver.
 
 Built pairing with Claude Code, as a learning project. Go 1.27; runs on this laptop only. All data is synthetic.
@@ -173,4 +175,4 @@ bash scripts/mutate.sh                          # four engine bugs, each caught 
 - **Block indexes are loaded fully into memory;** Prometheus memory-maps them. Chunks are read with `ReadAt`, not memory-mapped.
 - **One writer at a time** (a database-wide lock), and compaction blocks writes while it cuts a block.
 - **Not tested with a real Prometheus or Grafana:** compatibility was checked with Prometheus's own types and engine, not its running binary.
-- No CI, not published.
+- CI (badge above) was added when the project was published, 20 Nov 2026, after the build.
